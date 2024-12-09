@@ -1,4 +1,9 @@
 ﻿@page "/"
+@using System.Text
+@using Windows.Devices.Bluetooth
+@using Windows.Devices.Bluetooth.Rfcomm
+@using InTheHand.Net
+@using InTheHand.Net.Bluetooth
 @using InTheHand.Net.Sockets
 @rendermode InteractiveServer
 
@@ -49,6 +54,8 @@
 			<th>Device name</th>
 			<th>Class of device</th>
 			<th>Address</th>
+			<th>Services</th>
+			<th>Actions</th>
 		</tr>
 		</thead>
 		<tbody class="table-group-divider">
@@ -68,6 +75,19 @@
 				<td>@device.DeviceName</td>
 				<td>@device.ClassOfDevice.Device</td>
 				<td>@device.DeviceAddress</td>
+				<td>
+					<ul class="list-group">
+						@foreach (var service in device.Services)
+						{
+							<li class="list-item">
+								@service.Value.ServiceId.AsString() - @service.Key (@service.Value.DeviceAccessInformation.CurrentStatus)
+							</li>
+						}
+					</ul>
+				</td>
+				<td>
+					<button class="btn btn-dark" @onclick="async () => await TryConnect(device)">Try connect</button>
+				</td>
 			</tr>
 		}
 		</tbody>
@@ -100,15 +120,18 @@ else
 {
 	readonly State _state = new();
 	bool _searchProgress;
-	IEnumerable<BluetoothDeviceInfo> PairedDevices => Client.PairedDevices.OrderByDescending(d => d.Connected);
-	List<BluetoothDeviceInfo> Devices { get; } = [];
+	List<BluetoothDeviceModel> PairedDevices { get; } = [];
+	List<BluetoothDeviceModel> Devices { get; } = [];
 	BluetoothClient Client { get; set; }
 	CancellationTokenSource Cancellation { get; set; }
 
-	protected override void OnInitialized()
+	protected override async Task OnInitializedAsync()
 	{
-		Client = new BluetoothClient();
-		Cancellation = new CancellationTokenSource();
+		Client = new();
+		Cancellation = new();
+
+		foreach (var model in Client.PairedDevices.OrderByDescending(d => d.Connected).Select(BluetoothDeviceModel.FromDevice))
+			PairedDevices.Add(await model);
 	}
 
 	private void StopSearch()
@@ -129,13 +152,13 @@ else
 		try
 		{
 			if (!Cancellation.TryReset())
-				Cancellation = new CancellationTokenSource();
+				Cancellation = new();
 			var devicesAsync = Client.DiscoverDevicesAsync(Cancellation.Token);
 			await Task.Delay(1);
 
 			await foreach (var device in devicesAsync)
 			{
-				Devices.Add(device);
+				Devices.Add(await BluetoothDeviceModel.FromDevice(device));
 				logger.LogInformation("Find {DeviceName}", device.DeviceName);
 				StateHasChanged();
 			}
@@ -152,11 +175,6 @@ else
 		}
 	}
 
-	private string IsActive(Tab tab)
-	{
-		return _state.Tab == tab ? "active" : string.Empty;
-	}
-
 	private void SetTab(Tab tab)
 	{
 		StopSearch();
@@ -164,9 +182,48 @@ else
 			_state.Tab = tab;
 	}
 
+	private string IsActive(Tab tab)
+	{
+		return _state.Tab == tab ? "active" : string.Empty;
+	}
+
 	private void ToggleColumns()
 	{
 		_state.MoreColumns = !_state.MoreColumns;
+	}
+
+	private async Task TryConnect(BluetoothDeviceModel device)
+	{
+		logger.LogInformation("device connected: {Status}", device.Connected);
+
+		await Client.ConnectAsync(device.DeviceAddress, BluetoothService.Handsfree);
+		Client.Close();
+
+		await Client.ConnectAsync(device.DeviceAddress, BluetoothService.Handsfree);
+		if (Client.Connected)
+			logger.LogInformation("Connected");
+
+		var stream = Client.GetStream();
+		if (stream.CanRead)
+		{
+			var buff = new byte[1024];
+			var str = new StringBuilder();
+			var i = 0;
+			while (i++ < 5)
+			{
+				var bytesRead = await stream.ReadAsync(buff, 0, buff.Length);
+				var response = Encoding.ASCII.GetString(buff, 0, bytesRead);
+				str.Append(response);
+
+				var commandBytes = Encoding.ASCII.GetBytes(response);
+				stream.Write(commandBytes, 0, commandBytes.Length);
+			}
+
+			logger.LogInformation("{Msg}", str.ToString());
+		}
+
+		Client.Close();
+		logger.LogInformation("Close connection");
 	}
 
 	#region Inner classes
@@ -181,6 +238,44 @@ else
 	{
 		Paired,
 		New
+	}
+
+	class BluetoothDeviceModel
+	{
+		private BluetoothDeviceModel(BluetoothDeviceInfo bluetoothDeviceInfo, BluetoothDevice bluetoothDevice)
+		{
+			DeviceInfo = bluetoothDeviceInfo;
+			BluetoothDevice = bluetoothDevice;
+			Services = [];
+		}
+
+		public BluetoothAddress DeviceAddress => DeviceInfo.DeviceAddress;
+		public ClassOfDevice ClassOfDevice => DeviceInfo.ClassOfDevice;
+		public string DeviceName => DeviceInfo.DeviceName;
+		public bool Connected => DeviceInfo.Connected;
+
+		public Dictionary<string, RfcommDeviceService> Services { get; private set; }
+		public BluetoothDevice BluetoothDevice { get; }
+		public BluetoothDeviceInfo DeviceInfo { get; }
+
+		public static async Task<BluetoothDeviceModel> FromDevice(BluetoothDeviceInfo deviceInfo)
+		{
+			var bluDevice = await BluetoothDevice.FromBluetoothAddressAsync(deviceInfo.DeviceAddress);
+			var device = new BluetoothDeviceModel(deviceInfo, bluDevice);
+			await LoadServices(device);
+
+			return device;
+		}
+
+		private static async Task LoadServices(BluetoothDeviceModel model)
+		{
+			var serviceRes = await model.BluetoothDevice.GetRfcommServicesAsync();
+			if (serviceRes.Error != BluetoothError.Success)
+				return;
+
+			var i = 0;
+			model.Services = serviceRes.Services.ToDictionary(k => BluetoothService.GetName(k.ServiceId.Uuid) ?? $"Undefined{++i}", v => v);
+		}
 	}
 
 	#endregion
